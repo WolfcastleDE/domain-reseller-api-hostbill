@@ -1,0 +1,23 @@
+{
+    "name": "wolfscastle/domain-reseller-api-hostbill",
+    "description": "HostBill domain registrar module for the Domain Reseller API",
+    "type": "hostbill-module",
+    "require": {
+        "php": ">=7.4",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.6"
+    },
+    "autoload": {
+        "classmap": [
+            "includes/modules/Domain/DomainResellerApi/"
+        ]
+    },
+    "autoload-dev": {
+        "classmap": [
+            "tests/stubs/"
+        ]
+    }
+}
