@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: curl, json
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Run tests
+        run: vendor/bin/phpunit --colors=always
+
+  version:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.bump.outputs.new_version }}
+      changelog: ${{ steps.bump.outputs.changelog }}
+      skipped: ${{ steps.bump.outputs.skipped }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version bump
+        id: bump
+        run: |
+          # Get latest tag or default to v0.0.0
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v0.0.0"
+          fi
+
+          CURRENT="${LATEST_TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          # Analyse commits since last tag
+          if [ "$LATEST_TAG" = "v0.0.0" ]; then
+            COMMITS=$(git log --format="%s" HEAD)
+          else
+            COMMITS=$(git log --format="%s" "${LATEST_TAG}..HEAD")
+          fi
+
+          if [ -z "$COMMITS" ]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Determine bump type from conventional commits
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qiE '^feat(\(.+\))?!:|^[a-z]+(\(.+\))?!:|BREAKING CHANGE'; then
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qiE '^feat(\(.+\))?:'; then
+            BUMP="minor"
+          fi
+
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+          # Build changelog
+          {
+            echo "changelog<<CHANGELOG_EOF"
+            if [ "$LATEST_TAG" = "v0.0.0" ]; then
+              git log --format="- %s" HEAD
+            else
+              git log --format="- %s" "${LATEST_TAG}..HEAD"
+            fi
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: version
+    if: needs.version.outputs.skipped != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update version in source files
+        env:
+          VERSION: ${{ needs.version.outputs.new_version }}
+        run: |
+          MODULE="includes/modules/Domain/DomainResellerApi/class.domainresellerapi.php"
+          CLIENT="includes/modules/Domain/DomainResellerApi/DomainResellerApiClient.php"
+
+          # Update module version property and docblock
+          sed -i "s/protected \$version *= *'[^']*'/protected \$version     = '${VERSION}'/" "$MODULE"
+          sed -i "s/@version .*/@version ${VERSION}/" "$MODULE"
+
+          # Update user-agent version
+          MAJOR_MINOR=$(echo "$VERSION" | cut -d. -f1-2)
+          sed -i "s|HostBill-DomainResellerApi/[0-9.]*|HostBill-DomainResellerApi/${MAJOR_MINOR}|" "$CLIENT"
+
+      - name: Package module
+        env:
+          VERSION: ${{ needs.version.outputs.new_version }}
+        run: |
+          ARCHIVE="domain-reseller-api-hostbill-${VERSION}"
+          mkdir -p "dist/${ARCHIVE}/includes/modules/Domain/DomainResellerApi"
+
+          cp includes/modules/Domain/DomainResellerApi/class.domainresellerapi.php \
+             includes/modules/Domain/DomainResellerApi/DomainResellerApiClient.php \
+             "dist/${ARCHIVE}/includes/modules/Domain/DomainResellerApi/"
+
+          cd dist
+          zip -r "${ARCHIVE}.zip" "${ARCHIVE}/"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.new_version }}
+          CHANGELOG: ${{ needs.version.outputs.changelog }}
+        run: |
+          ARCHIVE="domain-reseller-api-hostbill-${VERSION}"
+
+          gh release create "v${VERSION}" \
+            "dist/${ARCHIVE}.zip" \
+            --title "v${VERSION}" \
+            --notes "## Changes
+
+          ${CHANGELOG}
+
+          ## Installation
+
+          1. Download \`${ARCHIVE}.zip\`
+          2. Extract into your HostBill root directory
+          3. Go to **Settings → Modules → Domain Modules** and activate **Domain Reseller API**"
