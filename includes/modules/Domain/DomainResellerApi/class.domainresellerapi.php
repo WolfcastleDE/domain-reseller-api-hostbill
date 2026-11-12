@@ -8,6 +8,11 @@
  * management, registrar lock, glue records, ID protection, EPP codes, and
  * domain synchronisation.
  *
+ * Method names, option keys and return formats follow the HostBill domain
+ * module dev kit (wiki.hostbillapp.com "Domain_Modules" and the official
+ * example modules cdn.hostbillapp.com/WIKI_img/hbdommod/example1.zip and
+ * example2.zip).
+ *
  * @version 1.0.0
  * @link    https://domain-reseller-api.de/dokumentation
  */
@@ -16,6 +21,7 @@ require_once __DIR__ . '/DomainResellerApiClient.php';
 
 class DomainResellerApi extends DomainModule
 {
+    protected $modname     = 'Domain Reseller API';
     protected $description = 'Domain Reseller API by Wolfscastle';
     protected $version     = '1.0.0';
 
@@ -58,7 +64,10 @@ class DomainResellerApi extends DomainModule
     ];
 
     /**
-     * Admin-available commands.
+     * Admin-available commands (buttons in Domain Management). The dev kit
+     * documents Register, Transfer, Renew, ContactInfo, DNSmanagement,
+     * EmailForwarding, RegisterNameServers and EppCode; RegistrarLock and
+     * IDProtection are not documented as commands.
      */
     protected $commands = [
         'Register',
@@ -175,9 +184,15 @@ class DomainResellerApi extends DomainModule
 
     /**
      * Log API call for HostBill debug panel.
+     *
+     * logCall() is not part of the documented DomainModule API (only
+     * logAction() is), so it is only used when the base class provides it.
      */
     private function log(string $action): void
     {
+        if (!method_exists($this, 'logCall')) {
+            return;
+        }
         $request = $this->api()->getLastRequest();
         $request['action'] = $action;
         $this->logCall($request, $this->api()->getLastResponse());
@@ -455,7 +470,10 @@ class DomainResellerApi extends DomainModule
     }
 
     /**
-     * Map an API contact response to HostBill display format.
+     * Map an API contact to the HostBill contact fields used by
+     * getContactInfo() (same keys as the client data: firstname, lastname,
+     * companyname, email, address1, address2, city, state, postcode,
+     * country, phonenumber).
      */
     private function mapApiContactToHostBill(array $c): array
     {
@@ -465,38 +483,17 @@ class DomainResellerApi extends DomainModule
         };
 
         return [
-            'First Name'   => $clean('firstName'),
-            'Last Name'    => $clean('lastName'),
-            'Company Name' => ($c['type'] ?? '') === 'person' ? '' : $clean('organization'),
-            'Email'        => $clean('email'),
-            'Address 1'    => trim($clean('street') . ' ' . $clean('houseNumber')),
-            'Address 2'    => $clean('extension'),
-            'City'         => $clean('city'),
-            'State'        => $clean('state'),
-            'Postcode'     => $clean('postalCode'),
-            'Country'      => $clean('country'),
-            'Phone'        => $clean('phone'),
-        ];
-    }
-
-    /**
-     * Map HostBill contact form data (labels as returned by getContactDetails())
-     * to the contact array format used by buildContactPayload().
-     */
-    private static function hostBillFormToContact(array $form): array
-    {
-        return [
-            'firstname'   => $form['First Name'] ?? '',
-            'lastname'    => $form['Last Name'] ?? '',
-            'companyname' => $form['Company Name'] ?? '',
-            'email'       => $form['Email'] ?? '',
-            'address1'    => $form['Address 1'] ?? '',
-            'address2'    => $form['Address 2'] ?? '',
-            'city'        => $form['City'] ?? '',
-            'state'       => $form['State'] ?? '',
-            'postcode'    => $form['Postcode'] ?? '',
-            'country'     => $form['Country'] ?? '',
-            'phonenumber' => $form['Phone'] ?? '',
+            'firstname'   => $clean('firstName'),
+            'lastname'    => $clean('lastName'),
+            'companyname' => ($c['type'] ?? '') === 'person' ? '' : $clean('organization'),
+            'email'       => $clean('email'),
+            'address1'    => trim($clean('street') . ' ' . $clean('houseNumber')),
+            'address2'    => $clean('extension'),
+            'city'        => $clean('city'),
+            'state'       => $clean('state'),
+            'postcode'    => $clean('postalCode'),
+            'country'     => $clean('country'),
+            'phonenumber' => $clean('phone'),
         ];
     }
 
@@ -681,6 +678,15 @@ class DomainResellerApi extends DomainModule
             }
 
             $this->disableApiAutoRenew($domain);
+
+            // ID protection ordered with the domain (dev kit: $this->options['idprotection'])
+            if (!empty($this->options['idprotection'])) {
+                $protection = $this->applyIdProtection($domain, true);
+                if (empty($protection['success'])) {
+                    $this->addError('Domain registered, but ID protection could not be enabled: '
+                        . ($protection['error'] ?? 'Unknown error'));
+                }
+            }
             return true;
         }
 
@@ -695,7 +701,7 @@ class DomainResellerApi extends DomainModule
     public function Transfer()
     {
         $domain  = $this->domainName();
-        $eppCode = $this->options['epp_code'] ?? $this->params['eppcode'] ?? '';
+        $eppCode = $this->options['epp_code'] ?? $this->params['epp_code'] ?? $this->params['eppcode'] ?? '';
 
         $contacts = $this->getContactHandles();
         if (!$contacts) {
@@ -814,12 +820,9 @@ class DomainResellerApi extends DomainModule
         $result = $this->api()->getDomain($domain);
         $this->log('getNameServers');
 
+        // Dev kit: "just a simple array with the nameservers of the domain"
         if (!empty($result['success']) && isset($result['data']['nameservers'])) {
-            $ns = [];
-            foreach (array_values((array)$result['data']['nameservers']) as $i => $nameserver) {
-                $ns['ns' . ($i + 1)] = $nameserver;
-            }
-            return $ns;
+            return array_values((array)$result['data']['nameservers']);
         }
 
         $this->addError('Failed to retrieve nameservers');
@@ -878,10 +881,15 @@ class DomainResellerApi extends DomainModule
     // Glue records (child nameservers)
     // =====================================================================
 
+    /**
+     * Glue records. HostBill passes the label of the host in NameServer
+     * (the dev kit builds the full name as NameServer.sld.tld), the IP in
+     * NameServerIP, NameServerOldIP/NameServerNewIP when modifying.
+     */
     public function registerNameServer()
     {
         $domain   = $this->domainName();
-        $hostname = strtolower(trim((string)$this->option(['NameServer', 'nameserver'])));
+        $hostname = $this->glueHostname($domain);
         $ip       = trim((string)$this->option(['NameServerIP', 'ipaddress']));
 
         list($ipv4, $ipv6) = self::splitIp($ip);
@@ -900,7 +908,7 @@ class DomainResellerApi extends DomainModule
     public function modifyNameServer()
     {
         $domain   = $this->domainName();
-        $hostname = strtolower(trim((string)$this->option(['NameServer', 'nameserver'])));
+        $hostname = $this->glueHostname($domain);
         $ip       = trim((string)$this->option(['NameServerNewIP', 'newipaddress']));
 
         list($ipv4, $ipv6) = self::splitIp($ip);
@@ -919,7 +927,7 @@ class DomainResellerApi extends DomainModule
     public function deleteNameServer()
     {
         $domain   = $this->domainName();
-        $hostname = strtolower(trim((string)$this->option(['NameServer', 'nameserver'])));
+        $hostname = $this->glueHostname($domain);
 
         $result = $this->api()->deleteHost($domain, $hostname);
         $this->log('deleteNameServer');
@@ -931,6 +939,19 @@ class DomainResellerApi extends DomainModule
 
         $this->addError('Failed to delete nameserver: ' . ($result['error'] ?? 'Unknown error'));
         return false;
+    }
+
+    /**
+     * Full host name of a glue record: the label from HostBill plus the
+     * domain (the API only accepts hosts below the domain, e.g. ns1.example.com).
+     */
+    private function glueHostname(string $domain): string
+    {
+        $host = rtrim(strtolower(trim((string)$this->option(['NameServer', 'nameserver']))), '.');
+        if ($host === '' || $host === $domain || substr($host, -strlen('.' . $domain)) === '.' . $domain) {
+            return $host;
+        }
+        return $host . '.' . $domain;
     }
 
     /**
@@ -1013,9 +1034,28 @@ class DomainResellerApi extends DomainModule
      */
     public function updateIDProtection()
     {
-        $domain  = $this->domainName();
-        $enabled = !empty($this->option(['idprotection', 'idProtection', 'id_protection']));
+        $domain = $this->domainName();
+        // The dev kit passes the requested state in IDProtection; idprotection
+        // holds the domain's stored flag, so it is only a fallback
+        $enabled = !empty($this->option(['IDProtection', 'idprotection', 'idProtection', 'id_protection']));
 
+        $result = $this->applyIdProtection($domain, $enabled);
+
+        if (!empty($result['success'])) {
+            $this->addInfo('ID protection ' . ($enabled ? 'enabled' : 'disabled') . ' for ' . $domain);
+            return true;
+        }
+
+        $this->addError('Failed to update ID protection: ' . ($result['error'] ?? 'Unknown error'));
+        return false;
+    }
+
+    /**
+     * Set WHOIS privacy (OpenProvider TLDs) or, for domains that are not routed
+     * to OpenProvider (HTTP 400), the WHOIS protection flag of the owner contact.
+     */
+    private function applyIdProtection(string $domain, bool $enabled): array
+    {
         $result = $this->api()->setWhoisPrivacy($domain, $enabled, $enabled);
         $this->log('updateIDProtection');
 
@@ -1028,13 +1068,7 @@ class DomainResellerApi extends DomainModule
             }
         }
 
-        if (!empty($result['success'])) {
-            $this->addInfo('ID protection ' . ($enabled ? 'enabled' : 'disabled') . ' for ' . $domain);
-            return true;
-        }
-
-        $this->addError('Failed to update ID protection: ' . ($result['error'] ?? 'Unknown error'));
-        return false;
+        return $result;
     }
 
     // =====================================================================
@@ -1042,37 +1076,104 @@ class DomainResellerApi extends DomainModule
     // =====================================================================
 
     /**
-     * Records of the managed DNS zone. Without managed DNS the API answers
-     * success:false and an empty list is returned; managed DNS is only
-     * enabled by setDNS() (it changes the nameservers of the domain).
+     * Record types offered in the HostBill DNS editor.
      */
-    public function getDNS()
+    const DNS_RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'SRV', 'CAA', 'NS'];
+
+    /**
+     * Records of the managed DNS zone in the dev kit format:
+     * ['hosts' => [['hostname', 'address', 'recordtype'], ...], 'records' => [types]].
+     * priority and ttl are added per host (not part of the documented format).
+     *
+     * Without managed DNS the API answers success:false and an empty host list
+     * is returned; managed DNS is only enabled by updateDNSmanagement() (it
+     * changes the nameservers of the domain).
+     */
+    public function getDNSmanagement()
     {
         $domain = $this->domainName();
         $result = $this->api()->getDnsRecords($domain);
-        $this->log('getDNS');
+        $this->log('getDNSmanagement');
 
-        if (empty($result['success']) || !isset($result['data']['records'])) {
-            return [];
-        }
-
-        $records = [];
-        foreach ($result['data']['records'] as $record) {
-            // Apex NS records of the managed nameservers are maintained by the API
-            if (!empty($record['managed'])) {
-                continue;
+        $hosts = [];
+        if (!empty($result['success']) && isset($result['data']['records'])) {
+            foreach ($result['data']['records'] as $record) {
+                // Apex NS records of the managed nameservers are maintained by the API
+                if (!empty($record['managed'])) {
+                    continue;
+                }
+                $hosts[] = [
+                    'hostname'   => $record['name'] ?? '',
+                    'address'    => $record['content'] ?? '',
+                    'recordtype' => $record['type'] ?? '',
+                    'priority'   => $record['priority'] ?? '',
+                    'ttl'        => $record['ttl'] ?? '',
+                ];
             }
-            $records[] = [
-                'hostname' => $record['name'] ?? '',
-                'type'     => $record['type'] ?? '',
-                'address'  => $record['content'] ?? '',
-                'priority' => $record['priority'] ?? '',
-            ];
         }
-        return $records;
+
+        return ['hosts' => $hosts, 'records' => self::DNS_RECORD_TYPES];
     }
 
-    public function setDNS($records)
+    /**
+     * Replace the records of the managed DNS zone with the records submitted
+     * in HostBill. The dev kit passes them as HostName{i}, RecordType{i} and
+     * Address{i} in $this->options (index from 0 or 1). A priority is not part
+     * of the documented form: it is taken from Priority{i} when present, or
+     * from an address like "10 mail.example.com" for MX/SRV.
+     */
+    public function updateDNSmanagement()
+    {
+        $records = $this->dnsRecordsFromOptions();
+        if ($records === null) {
+            // Nothing submitted: do not wipe the zone
+            $this->addError('No DNS records were submitted');
+            return false;
+        }
+        return $this->replaceDnsRecords($records);
+    }
+
+    /**
+     * @return array|null Records from the HostBill form, null if the form has no record fields
+     */
+    private function dnsRecordsFromOptions(): ?array
+    {
+        $options = is_array($this->options) ? $this->options : [];
+        $found   = false;
+        $records = [];
+
+        for ($i = 0; $i <= 1 || isset($options['HostName' . $i]) || isset($options['RecordType' . $i]); $i++) {
+            if (!isset($options['HostName' . $i]) && !isset($options['RecordType' . $i])) {
+                continue;
+            }
+            $found   = true;
+            $type    = strtoupper(trim((string)($options['RecordType' . $i] ?? '')));
+            $address = trim((string)($options['Address' . $i] ?? ''));
+            if ($type === '' || $address === '') {
+                continue; // removed row
+            }
+
+            $record = [
+                'hostname' => (string)($options['HostName' . $i] ?? ''),
+                'type'     => $type,
+                'address'  => $address,
+            ];
+            if (isset($options['Priority' . $i]) && $options['Priority' . $i] !== '') {
+                $record['priority'] = $options['Priority' . $i];
+            } elseif (in_array($type, ['MX', 'SRV'], true) && preg_match('/^(\d{1,5})\s+(\S.*)$/', $address, $m)) {
+                $record['priority'] = $m[1];
+                $record['address']  = $m[2];
+            }
+            $records[] = $record;
+        }
+
+        return $found ? $records : null;
+    }
+
+    /**
+     * @param array $records [['hostname', 'type', 'address', 'priority'?, 'ttl'?], ...]
+     */
+    private function replaceDnsRecords(array $records): bool
     {
         $domain = $this->domainName();
 
@@ -1179,38 +1280,51 @@ class DomainResellerApi extends DomainModule
     // Contact Info
     // =====================================================================
 
-    public function getContactDetails()
+    /**
+     * HostBill role => API role.
+     */
+    const CONTACT_ROLES = [
+        'registrant' => 'owner',
+        'admin'      => 'admin',
+        'tech'       => 'tech',
+        'billing'    => 'billing',
+    ];
+
+    /**
+     * Contacts of the domain in the dev kit format:
+     * ['registrant' => [...], 'admin' => [...], 'tech' => [...], 'billing' => [...]].
+     */
+    public function getContactInfo()
     {
         $domain = $this->domainName();
         $result = $this->api()->getDomain($domain);
-        $this->log('getContactDetails');
+        $this->log('getContactInfo');
 
         if (empty($result['success']) || empty($result['data'])) {
             $this->addError('Failed to retrieve domain details');
             return false;
         }
 
-        $data = $result['data'];
-        $contacts = $data['contacts'] ?? [];
-        $output = [];
+        $contacts = $result['data']['contacts'] ?? [];
+        $output   = [];
+        $cache    = [];
 
-        $typeMap = [
-            'owner' => 'Registrant',
-            'admin' => 'Admin',
-            'tech'  => 'Tech',
-        ];
-
-        foreach ($typeMap as $apiKey => $label) {
-            $handleId = $contacts[$apiKey] ?? null;
-            if (!$handleId) {
+        foreach (self::CONTACT_ROLES as $role => $apiKey) {
+            $handle = $contacts[$apiKey] ?? null;
+            if (!$handle) {
                 continue;
             }
 
-            $contactResult = $this->api()->getContact($handleId);
-            $this->log('getContact-' . $apiKey);
+            if (!array_key_exists($handle, $cache)) {
+                $contactResult = $this->api()->getContact($handle);
+                $this->log('getContact-' . $apiKey);
+                $cache[$handle] = !empty($contactResult['success']) && !empty($contactResult['data'])
+                    ? $this->mapApiContactToHostBill($contactResult['data'])
+                    : null;
+            }
 
-            if (!empty($contactResult['success']) && !empty($contactResult['data'])) {
-                $output[$label] = $this->mapApiContactToHostBill($contactResult['data']);
+            if ($cache[$handle] !== null) {
+                $output[$role] = $cache[$handle];
             }
         }
 
@@ -1218,20 +1332,21 @@ class DomainResellerApi extends DomainModule
     }
 
     /**
-     * Update the contacts of the domain.
+     * Update the contacts of the domain from $this->options['registrant'|'admin'|'tech'|'billing']
+     * (dev kit: HostBill passes the submitted contacts there, with the client data keys).
      *
-     * Each role's handle is updated in place (PATCH /contacts/:handle). Admin
-     * and tech usually share the owner's handle (see getContactHandles()); when
-     * such a role gets different data, a new contact is created and assigned
+     * Each role's handle is updated in place (PATCH /contacts/:handle). Admin,
+     * tech and billing usually share the owner's handle (see getContactHandles());
+     * when such a role gets different data, a new contact is created and assigned
      * via PATCH /domains/:domain/contacts instead, so the owner stays intact.
      */
-    public function setContactDetails($params)
+    public function updateContactInfo()
     {
         $domain = $this->domainName();
 
         // Get current domain to find existing contact handles
         $domainResult = $this->api()->getDomain($domain);
-        $this->log('getContactDetails-forSet');
+        $this->log('updateContactInfo-domain');
 
         if (empty($domainResult['success']) || empty($domainResult['data'])) {
             $this->addError('Failed to retrieve domain info');
@@ -1239,20 +1354,14 @@ class DomainResellerApi extends DomainModule
         }
 
         $contacts = $domainResult['data']['contacts'] ?? [];
-        $success = true;
-
-        $typeMap = [
-            'Registrant' => 'owner',
-            'Admin'      => 'admin',
-            'Tech'       => 'tech',
-        ];
+        $success  = true;
 
         // Handles already updated in this call, with the data they were updated to
-        $updated = [];
+        $updated  = [];
         $reassign = [];
 
-        foreach ($typeMap as $label => $apiKey) {
-            if (empty($params[$label]) || !is_array($params[$label])) {
+        foreach (self::CONTACT_ROLES as $role => $apiKey) {
+            if (empty($this->options[$role]) || !is_array($this->options[$role])) {
                 continue;
             }
 
@@ -1261,8 +1370,9 @@ class DomainResellerApi extends DomainModule
                 continue;
             }
 
-            $contact = self::hostBillFormToContact($params[$label]);
+            $contact = $this->options[$role];
             $payload = self::buildContactUpdatePayload($contact);
+            $label   = ucfirst($role);
 
             $invalid = self::invalidContactFields($payload);
             if (!empty($invalid)) {
@@ -1318,11 +1428,15 @@ class DomainResellerApi extends DomainModule
     // EPP / Auth Code
     // =====================================================================
 
-    public function getEPPCode()
+    /**
+     * EPP/auth code as string (dev kit name: getEppCode; PHP method names are
+     * case-insensitive, so getEPPCode() resolves to the same method).
+     */
+    public function getEppCode()
     {
         $domain = $this->domainName();
         $result = $this->api()->getAuthCode($domain);
-        $this->log('getEPPCode');
+        $this->log('getEppCode');
 
         $authCode = $result['data']['authCode'] ?? '';
         // The API returns this text in authCode when the registrar has no code
@@ -1337,6 +1451,41 @@ class DomainResellerApi extends DomainModule
     // =====================================================================
     // Domain Check / Lookup
     // =====================================================================
+
+    /**
+     * Availability check with the signature used by current HostBill modules
+     * (lookupDomain($sld, $tld, $settings), e.g. the Domain Name API module).
+     * Not part of the public dev kit; HostBill may only call it for modules
+     * implementing its DomainLookupInterface (see README).
+     *
+     * @return array ['available' => bool, 'premium' => ['register' => price, 'currency' => 'EUR']?]
+     */
+    public function lookupDomain($sld, $tld, $settings = [])
+    {
+        $response = ['available' => false];
+
+        try {
+            $domain = strtolower($this->validateDomainName(trim((string)$sld) . '.' . ltrim(trim((string)$tld), '.')));
+        } catch (\InvalidArgumentException $e) {
+            return $response;
+        }
+
+        $result = $this->api()->checkDomain($domain);
+        $this->log('lookupDomain');
+
+        if (empty($result['success']) || !isset($result['data'])) {
+            return $response;
+        }
+
+        $response['available'] = !empty($result['data']['available']);
+        if (!empty($result['data']['premium']) && isset($result['data']['price'])) {
+            $response['premium'] = [
+                'register' => number_format((float)$result['data']['price'], 2, '.', ''),
+                'currency' => 'EUR',
+            ];
+        }
+        return $response;
+    }
 
     public function checkAvailability()
     {
@@ -1376,17 +1525,19 @@ class DomainResellerApi extends DomainModule
 
         $data = $result['data'];
 
-        // Domain states of the API (see GET /domains/:domain/state)
+        // Domain states of the API (see GET /domains/:domain/state) mapped to the
+        // statuses the dev kit documents for synchInfo(): Active, Pending,
+        // Pending Transfer, Pending Registration, Expired
         $statusMap = [
-            'pending'          => 'Pending',
+            'pending'          => 'Pending Registration', // ordered at the registrar, not yet registered
             'pending_transfer' => 'Pending Transfer',
             'active'           => 'Active',
             'expired'          => 'Expired',
             'redemption'       => 'Expired',
             'pending_delete'   => 'Active', // still active until the scheduled deletion
-            'transferred_away' => 'Transferred Away',
+            'transferred_away' => 'Expired', // no longer with this registrar
             'suspended'        => 'Active',
-            'deleted'          => 'Cancelled',
+            'deleted'          => 'Expired',
         ];
 
         $apiStatus = strtolower($data['status'] ?? '');
@@ -1399,6 +1550,21 @@ class DomainResellerApi extends DomainModule
         if (!empty($data['expiresAt'])) {
             $return['expires'] = date('Y-m-d', strtotime($data['expiresAt']));
         }
+
+        // Nameservers (dev kit: array of nameservers)
+        if (isset($data['nameservers']) && is_array($data['nameservers'])) {
+            $return['ns'] = array_values($data['nameservers']);
+        }
+
+        // ID protection (dev kit: 1/0). The registrar lock is not synchronised:
+        // it needs a live registrar call per domain (getRegistrarLock()).
+        $protected = !empty($data['whoisPrivacy']);
+        if (!$protected && !empty($data['contacts']['owner'])) {
+            $owner = $this->api()->getContact($data['contacts']['owner']);
+            $this->log('synchInfo-contact');
+            $protected = !empty($owner['success']) && !empty($owner['data']['protection']);
+        }
+        $return['idprotection'] = $protected ? 1 : 0;
 
         // Renewals are driven by HostBill: turn the API's auto-renew off once
         // the domain can be modified (e.g. after a completed transfer)
@@ -1452,6 +1618,61 @@ class DomainResellerApi extends DomainModule
         }
 
         return $pricing;
+    }
+
+    /**
+     * TLD prices in the format of current HostBill price import modules
+     * (getDomainPrices(), e.g. the Domain Name API module):
+     * ['EUR' => [tld => [years => ['period', 'register', 'transfer', 'renew', 'redemption']]]].
+     * Not part of the public dev kit; HostBill may only call it for modules
+     * implementing its DomainPriceImport interface (see README).
+     *
+     * register/renew are the exact net totals per term (`periods` of the API).
+     * A transfer is only offered for the term it covers (transferYears, 2 for .ai).
+     *
+     * @return array|string Prices, or the error message
+     */
+    public function getDomainPrices()
+    {
+        $result = $this->api()->getPricing();
+        $this->log('getDomainPrices');
+
+        if (empty($result['success']) || empty($result['data']) || !is_array($result['data'])) {
+            return 'Failed to fetch pricing data: ' . ($result['error'] ?? 'Unknown error');
+        }
+
+        $prices = [];
+        foreach ($result['data'] as $tld) {
+            $tldName = $tld['tld'] ?? '';
+            if ($tldName === '' || empty($tld['periods']) || !is_array($tld['periods'])) {
+                continue;
+            }
+
+            $transferYears = (int)($tld['transferYears'] ?? 1);
+            foreach ($tld['periods'] as $term) {
+                $years = (int)($term['years'] ?? 0);
+                if ($years < 1 || !isset($term['registerPrice'])) {
+                    continue;
+                }
+
+                $row = [
+                    'period'   => $years,
+                    'register' => number_format((float)$term['registerPrice'], 2, '.', ''),
+                ];
+                if (isset($term['renewPrice'])) {
+                    $row['renew'] = number_format((float)$term['renewPrice'], 2, '.', '');
+                }
+                if ($years === $transferYears && isset($tld['transferPrice'])) {
+                    $row['transfer'] = number_format((float)$tld['transferPrice'], 2, '.', '');
+                }
+                if (isset($tld['restorePrice'])) {
+                    $row['redemption'] = number_format((float)$tld['restorePrice'], 2, '.', '');
+                }
+                $prices['EUR'][$tldName][$years] = $row;
+            }
+        }
+
+        return $prices;
     }
 
     // =====================================================================
