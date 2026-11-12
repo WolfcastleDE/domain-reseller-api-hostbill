@@ -107,6 +107,147 @@ class DomainResellerApiClientTest extends TestCase
         ], $c->capturedData);
     }
 
+    public function testRegisterDomainOmitsEmptyNameserversAndYears(): void
+    {
+        // nameservers has minItems 2 in the API; years defaults to the TLD minimum
+        $c = $this->client();
+        $c->registerDomain('test.ai', null, [], ['owner' => 'H1']);
+
+        $this->assertSame(['domain' => 'test.ai', 'contacts' => ['owner' => 'H1']], $c->capturedData);
+    }
+
+    public function testRegisterDomainWithWhoisPrivacy(): void
+    {
+        $c = $this->client();
+        $c->registerDomain('test.com', 1, [], ['owner' => 'H1'], ['whoisPrivacy' => true, 'acceptWppTerms' => true]);
+
+        $this->assertTrue($c->capturedData['whoisPrivacy']);
+        $this->assertTrue($c->capturedData['acceptWppTerms']);
+    }
+
+    public function testCheckDomainWithYears(): void
+    {
+        $c = $this->client();
+        $c->checkDomain('example.ai', 2);
+        $this->assertSame(['years' => 2], $c->capturedQuery);
+    }
+
+    public function testRenewDomain(): void
+    {
+        $c = $this->client();
+        $c->renewDomain('test.com', 3);
+        $this->assertSame('POST', $c->capturedMethod);
+        $this->assertSame('/domains/test.com/renew', $c->capturedEndpoint);
+        $this->assertSame(['years' => 3], $c->capturedData);
+    }
+
+    public function testRenewDomainDefaultTerm(): void
+    {
+        $c = $this->client();
+        $c->renewDomain('test.ai');
+        $this->assertSame([], $c->capturedData);
+    }
+
+    public function testUpdateDomainContacts(): void
+    {
+        $c = $this->client();
+        $c->updateDomainContacts('test.com', ['admin' => 'H2', 'tech' => 'H3']);
+        $this->assertSame('PATCH', $c->capturedMethod);
+        $this->assertSame('/domains/test.com/contacts', $c->capturedEndpoint);
+        $this->assertSame(['contacts' => ['admin' => 'H2', 'tech' => 'H3']], $c->capturedData);
+    }
+
+    public function testUpdateDomainContactsConfirmOwnerChange(): void
+    {
+        $c = $this->client();
+        $c->updateDomainContacts('test.com', ['owner' => 'H9'], true);
+        $this->assertSame(['contacts' => ['owner' => 'H9'], 'confirmOwnerChange' => true], $c->capturedData);
+    }
+
+    public function testLockEndpoints(): void
+    {
+        $c = $this->client();
+        $c->getLock('test.com');
+        $this->assertSame('GET', $c->capturedMethod);
+        $this->assertSame('/domains/test.com/lock', $c->capturedEndpoint);
+
+        $c->setLock('test.com', false);
+        $this->assertSame('PUT', $c->capturedMethod);
+        $this->assertSame('/domains/test.com/lock', $c->capturedEndpoint);
+        $this->assertSame(['locked' => false], $c->capturedData);
+    }
+
+    public function testWhoisPrivacy(): void
+    {
+        $c = $this->client();
+        $c->setWhoisPrivacy('test.com', true, true);
+        $this->assertSame('PUT', $c->capturedMethod);
+        $this->assertSame('/domains/test.com/whois-privacy', $c->capturedEndpoint);
+        $this->assertSame(['enabled' => true, 'acceptWppTerms' => true], $c->capturedData);
+
+        $c->setWhoisPrivacy('test.com', false);
+        $this->assertSame(['enabled' => false], $c->capturedData);
+    }
+
+    public function testHostEndpoints(): void
+    {
+        $c = $this->client();
+        $c->getHosts('test.com');
+        $this->assertSame('GET', $c->capturedMethod);
+        $this->assertSame('/domains/test.com/hosts', $c->capturedEndpoint);
+
+        $c->createHost('test.com', 'ns1.test.com', '192.0.2.1');
+        $this->assertSame('POST', $c->capturedMethod);
+        $this->assertSame('/domains/test.com/hosts', $c->capturedEndpoint);
+        $this->assertSame(['hostname' => 'ns1.test.com', 'ipv4' => '192.0.2.1'], $c->capturedData);
+
+        $c->updateHost('test.com', 'ns1.test.com', '', '2001:db8::1');
+        $this->assertSame('PUT', $c->capturedMethod);
+        $this->assertSame('/domains/test.com/hosts/ns1.test.com', $c->capturedEndpoint);
+        $this->assertSame(['ipv6' => '2001:db8::1'], $c->capturedData);
+
+        $c->deleteHost('test.com', 'ns1.test.com');
+        $this->assertSame('DELETE', $c->capturedMethod);
+        $this->assertSame('/domains/test.com/hosts/ns1.test.com', $c->capturedEndpoint);
+    }
+
+    // =================================================================
+    // Body encoding & response normalisation
+    // =================================================================
+
+    public function testEmptyBodyIsEncodedAsObject(): void
+    {
+        // "[]" would fail the API's t.Object() body schemas (e.g. POST /renew)
+        $this->assertSame('{}', DomainResellerApiClient::encodeBody([]));
+        $this->assertSame('{"years":2}', DomainResellerApiClient::encodeBody(['years' => 2]));
+    }
+
+    public function testNormalizeResponseAppendsValidationDetails(): void
+    {
+        $result = DomainResellerApiClient::normalizeResponse([
+            'success' => false,
+            'error'   => 'Validation error',
+            'details' => "Expected union value at '/type'",
+        ], 400);
+
+        $this->assertFalse($result['success']);
+        $this->assertSame("Validation error: Expected union value at '/type'", $result['error']);
+        $this->assertSame(400, $result['code']);
+    }
+
+    public function testNormalizeResponseFallsBackToHttpCode(): void
+    {
+        $ok = DomainResellerApiClient::normalizeResponse(['data' => ['x' => 1]], 200);
+        $this->assertTrue($ok['success']);
+
+        $fail = DomainResellerApiClient::normalizeResponse(['message' => 'Not found'], 404);
+        $this->assertFalse($fail['success']);
+        $this->assertSame('Not found', $fail['error']);
+
+        $invalid = DomainResellerApiClient::normalizeResponse(null, 502);
+        $this->assertSame(['success' => false, 'error' => 'Invalid JSON response', 'code' => 502], $invalid);
+    }
+
     public function testTransferDomain(): void
     {
         $c = $this->client();

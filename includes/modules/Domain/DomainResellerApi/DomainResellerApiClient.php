@@ -100,15 +100,15 @@ class DomainResellerApiClient
         switch (strtoupper($method)) {
             case 'POST':
                 curl_setopt($ch, CURLOPT_POST, true);
-                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+                curl_setopt($ch, CURLOPT_POSTFIELDS, self::encodeBody($data));
                 break;
             case 'PATCH':
                 curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PATCH');
-                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+                curl_setopt($ch, CURLOPT_POSTFIELDS, self::encodeBody($data));
                 break;
             case 'PUT':
                 curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
-                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+                curl_setopt($ch, CURLOPT_POSTFIELDS, self::encodeBody($data));
                 break;
             case 'DELETE':
                 curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
@@ -129,15 +129,51 @@ class DomainResellerApiClient
         }
 
         $decoded = json_decode($response, true);
-        $this->lastResponse = $decoded ?: ['raw' => $response];
+        $this->lastResponse = is_array($decoded) ? $decoded : ['raw' => $response];
 
-        if ($decoded === null) {
+        return self::normalizeResponse($decoded, $httpCode);
+    }
+
+    /**
+     * JSON request body. An empty body is sent as an object ("{}"), never as
+     * an array ("[]"), which the API's t.Object() schemas would reject.
+     */
+    public static function encodeBody(array $data): string
+    {
+        return empty($data) ? '{}' : json_encode($data);
+    }
+
+    /**
+     * Normalise a decoded API response to {success, data?, error?, code}.
+     *
+     * The API answers with {"success": bool, "data"?: ..., "error"?: string};
+     * schema violations come as HTTP 400 {"success": false, "error":
+     * "Validation error", "details": "..."} and the details are appended to
+     * the error so that HostBill shows what was rejected.
+     *
+     * @param mixed $decoded
+     */
+    public static function normalizeResponse($decoded, int $httpCode): array
+    {
+        if (!is_array($decoded)) {
             return ['success' => false, 'error' => 'Invalid JSON response', 'code' => $httpCode];
         }
 
         // Ensure 'success' key exists, falling back to HTTP status code
         if (!isset($decoded['success'])) {
             $decoded['success'] = ($httpCode >= 200 && $httpCode < 300);
+        }
+        $decoded['success'] = (bool) $decoded['success'];
+
+        if (!$decoded['success']) {
+            $error = is_string($decoded['error'] ?? null) && $decoded['error'] !== ''
+                ? $decoded['error']
+                : (is_string($decoded['message'] ?? null) ? $decoded['message'] : 'HTTP ' . $httpCode);
+            if (!empty($decoded['details'])) {
+                $details = is_string($decoded['details']) ? $decoded['details'] : json_encode($decoded['details']);
+                $error .= ': ' . substr($details, 0, 500);
+            }
+            $decoded['error'] = $error;
         }
 
         $decoded['code'] = $httpCode;
@@ -153,9 +189,11 @@ class DomainResellerApiClient
      */
     private function redactSensitive(array $data): array
     {
-        $sensitiveKeys = ['authCode', 'auth_code', 'eppCode', 'epp_code', 'password'];
-        foreach ($sensitiveKeys as $key) {
-            if (isset($data[$key]) && is_string($data[$key]) && strlen($data[$key]) > 0) {
+        $sensitiveKeys = ['authCode', 'auth_code', 'eppCode', 'epp_code', 'password', 'pin'];
+        foreach ($data as $key => $value) {
+            if (is_array($value)) {
+                $data[$key] = $this->redactSensitive($value);
+            } elseif (in_array($key, $sensitiveKeys, true) && is_string($value) && strlen($value) > 0) {
                 $data[$key] = '***REDACTED***';
             }
         }
@@ -175,28 +213,48 @@ class DomainResellerApiClient
     // Domains
     // ------------------------------------------------------------------
 
-    public function checkDomain(string $domain): array
+    public function checkDomain(string $domain, ?int $years = null): array
     {
-        return $this->request('GET', '/domains/check/' . urlencode($domain));
+        $query = $years !== null ? ['years' => $years] : [];
+        return $this->request('GET', '/domains/check/' . urlencode($domain), [], $query);
     }
 
-    public function registerDomain(string $domain, int $years, array $nameservers, array $contacts): array
+    /**
+     * POST /domains/register
+     *
+     * @param int|null $years     Registration term; null lets the API use the TLD's minimum term (e.g. 2 for .ai)
+     * @param string[] $nameservers 2-6 hostnames, or [] for the API default (managed DNS)
+     * @param array    $contacts  owner (required), admin, tech, billing => contact handle
+     * @param array    $extra     Optional fields: whoisPrivacy, acceptWppTerms
+     */
+    public function registerDomain(string $domain, ?int $years, array $nameservers, array $contacts, array $extra = []): array
     {
-        return $this->request('POST', '/domains/register', [
-            'domain'      => $domain,
-            'years'       => $years,
-            'nameservers' => $nameservers,
-            'contacts'    => $contacts,
-        ]);
+        $data = ['domain' => $domain];
+        if ($years !== null) {
+            $data['years'] = $years;
+        }
+        // The API requires 2-6 nameservers when the field is present
+        if (!empty($nameservers)) {
+            $data['nameservers'] = array_values($nameservers);
+        }
+        $data['contacts'] = $contacts;
+
+        return $this->request('POST', '/domains/register', $data + $extra);
     }
 
-    public function transferDomain(string $domain, string $authCode, array $contacts): array
+    /**
+     * POST /domains/transfer
+     *
+     * @param array $contacts owner (required), admin, tech, billing => contact handle
+     * @param array $extra    Optional fields: whoisPrivacy, acceptWppTerms
+     */
+    public function transferDomain(string $domain, string $authCode, array $contacts, array $extra = []): array
     {
         return $this->request('POST', '/domains/transfer', [
             'domain'   => $domain,
             'authCode' => $authCode,
             'contacts' => $contacts,
-        ]);
+        ] + $extra);
     }
 
     public function getDomain(string $domain): array
@@ -204,9 +262,99 @@ class DomainResellerApiClient
         return $this->request('GET', '/domains/' . urlencode($domain));
     }
 
+    /**
+     * PATCH /domains/:domain — any of nameservers (2-6), autoRenew, useManagedDns.
+     */
     public function updateDomain(string $domain, array $data): array
     {
         return $this->request('PATCH', '/domains/' . urlencode($domain), $data);
+    }
+
+    /**
+     * PATCH /domains/:domain/contacts — assign other contact handles to roles.
+     * Changing the owner is an owner change and needs $confirmOwnerChange.
+     *
+     * @param array $contacts Any of owner, admin, tech, billing => handle
+     */
+    public function updateDomainContacts(string $domain, array $contacts, bool $confirmOwnerChange = false): array
+    {
+        $data = ['contacts' => $contacts];
+        if ($confirmOwnerChange) {
+            $data['confirmOwnerChange'] = true;
+        }
+        return $this->request('PATCH', '/domains/' . urlencode($domain) . '/contacts', $data);
+    }
+
+    /**
+     * POST /domains/:domain/renew — charges the wallet and extends the expiry date.
+     *
+     * @param int|null $years Renewal term; null = the TLD's minimum term
+     */
+    public function renewDomain(string $domain, ?int $years = null): array
+    {
+        $data = $years !== null ? ['years' => $years] : [];
+        return $this->request('POST', '/domains/' . urlencode($domain) . '/renew', $data);
+    }
+
+    public function getLock(string $domain): array
+    {
+        return $this->request('GET', '/domains/' . urlencode($domain) . '/lock');
+    }
+
+    public function setLock(string $domain, bool $locked): array
+    {
+        return $this->request('PUT', '/domains/' . urlencode($domain) . '/lock', ['locked' => $locked]);
+    }
+
+    /**
+     * PUT /domains/:domain/whois-privacy (OpenProvider TLDs, natural persons only).
+     * Enabling requires the registrant's acceptance of the WPP terms.
+     */
+    public function setWhoisPrivacy(string $domain, bool $enabled, bool $acceptWppTerms = false): array
+    {
+        $data = ['enabled' => $enabled];
+        if ($enabled) {
+            $data['acceptWppTerms'] = $acceptWppTerms;
+        }
+        return $this->request('PUT', '/domains/' . urlencode($domain) . '/whois-privacy', $data);
+    }
+
+    // ------------------------------------------------------------------
+    // Hosts (glue records)
+    // ------------------------------------------------------------------
+
+    public function getHosts(string $domain): array
+    {
+        return $this->request('GET', '/domains/' . urlencode($domain) . '/hosts');
+    }
+
+    public function createHost(string $domain, string $hostname, string $ipv4 = '', string $ipv6 = ''): array
+    {
+        return $this->request('POST', '/domains/' . urlencode($domain) . '/hosts',
+            ['hostname' => $hostname] + self::hostIps($ipv4, $ipv6));
+    }
+
+    public function updateHost(string $domain, string $hostname, string $ipv4 = '', string $ipv6 = ''): array
+    {
+        return $this->request('PUT', '/domains/' . urlencode($domain) . '/hosts/' . urlencode($hostname),
+            self::hostIps($ipv4, $ipv6));
+    }
+
+    public function deleteHost(string $domain, string $hostname): array
+    {
+        return $this->request('DELETE', '/domains/' . urlencode($domain) . '/hosts/' . urlencode($hostname));
+    }
+
+    private static function hostIps(string $ipv4, string $ipv6): array
+    {
+        $ips = [];
+        if ($ipv4 !== '') {
+            $ips['ipv4'] = $ipv4;
+        }
+        if ($ipv6 !== '') {
+            $ips['ipv6'] = $ipv6;
+        }
+        return $ips;
     }
 
     public function deleteDomain(string $domain, bool $immediate = false): array

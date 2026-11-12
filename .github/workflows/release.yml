@@ -7,6 +7,11 @@ on:
 permissions:
   contents: write
 
+# Two pushes in quick succession must not compute and create the same tag
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -118,14 +123,19 @@ jobs:
           VERSION: ${{ needs.version.outputs.new_version }}
         run: |
           ARCHIVE="domain-reseller-api-hostbill-${VERSION}"
-          mkdir -p "dist/${ARCHIVE}/includes/modules/Domain/DomainResellerApi"
+          MODULE_DIR="dist/${ARCHIVE}/includes/modules/Domain/DomainResellerApi"
+          mkdir -p "$MODULE_DIR"
 
           cp includes/modules/Domain/DomainResellerApi/class.domainresellerapi.php \
              includes/modules/Domain/DomainResellerApi/DomainResellerApiClient.php \
-             "dist/${ARCHIVE}/includes/modules/Domain/DomainResellerApi/"
+             LICENSE README.md \
+             "$MODULE_DIR/"
 
-          cd dist
-          zip -r "${ARCHIVE}.zip" "${ARCHIVE}/"
+          # includes/ at the root of the ZIP: it is extracted into the HostBill root directory
+          cd "dist/${ARCHIVE}"
+          zip -r "../${ARCHIVE}.zip" includes
+          cd ..
+          unzip -l "${ARCHIVE}.zip"
 
       - name: Create release
         env:
@@ -137,6 +147,7 @@ jobs:
 
           gh release create "v${VERSION}" \
             "dist/${ARCHIVE}.zip" \
+            --target "${GITHUB_SHA}" \
             --title "v${VERSION}" \
             --notes "## Changes
 
@@ -145,5 +156,7 @@ jobs:
           ## Installation
 
           1. Download \`${ARCHIVE}.zip\`
-          2. Extract into your HostBill root directory
-          3. Go to **Settings → Modules → Domain Modules** and activate **Domain Reseller API**"
+          2. Extract it into your HostBill root directory (creates \`includes/modules/Domain/DomainResellerApi/\`)
+          3. Go to **Settings → Modules → Domain Modules** and activate **Domain Reseller API**
+
+          Documentation: https://domain-reseller-api.de/dokumentation"
