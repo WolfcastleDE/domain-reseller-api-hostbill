@@ -3,12 +3,21 @@
 /**
  * Stub of HostBill's DomainModule base class for testing purposes.
  *
- * Provides the same public/protected API surface that real HostBill modules
- * rely on so that DomainResellerApi can be instantiated and tested in
- * isolation without a full HostBill installation.
+ * Documented by the HostBill domain module dev kit
+ * (wiki.hostbillapp.com/index.php?title=Domain_Modules, example1/2.zip from
+ * cdn.hostbillapp.com/WIKI_img/hbdommod/): $description, $configuration,
+ * $lang, $commands, $options, $client_data, $params, addInfo(), addError(),
+ * addDomain(), addPeriod(), logAction(). $modname, $version,
+ * $clientCommands, $domain_contacts and $name are used by current
+ * open-source modules (domainreseller/hostbill-dna).
+ *
+ * NOT documented (unverified, the module only calls them via method_exists):
+ * logCall(), setExpiryDate(). Visibility of the properties is public here to
+ * simplify tests; in HostBill they may be protected.
  */
 class DomainModule
 {
+    protected $modname     = '';
     protected $description = '';
     protected $version     = '';
 
@@ -64,6 +73,9 @@ class DomainModule
     /** @var bool Whether addPeriod() was called */
     public $_periodAdded = false;
 
+    /** @var array logAction() entries */
+    public $_actions = [];
+
     /** @var string|null Expiry date set via setExpiryDate() */
     public $_expiryDate = null;
 
@@ -86,9 +98,15 @@ class DomainModule
         $this->_logCalls[] = ['request' => $request, 'response' => $response];
     }
 
-    protected function addDomain(string $status): void
+    protected function logAction(array $action): void
+    {
+        $this->_actions[] = $action;
+    }
+
+    protected function addDomain(string $status): bool
     {
         $this->_domainStatus = $status;
+        return true;
     }
 
     protected function addPeriod(): void

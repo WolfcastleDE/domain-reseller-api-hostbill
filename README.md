@@ -13,15 +13,16 @@ API documentation: <https://domain-reseller-api.de/dokumentation>
 | **Registration** | Registers domains for the HostBill period (1–10 years) with 2–6 nameservers, or with the managed DNS when no nameservers are given |
 | **Transfer** | Transfers with the EPP/auth code |
 | **Renewal** | Paid renewals via `POST /domains/{domain}/renew` for the HostBill period; the new expiry date is written back |
-| **Contacts** | Creates owner/admin/tech handles from the client or domain contacts (`person`, or `organization` when a company name is set); editing updates the handles, admin/tech get their own handle when they differ from the owner |
+| **Contacts** | Creates owner/admin/tech handles from the client or domain contacts (`person`, or `organization` when a company name is set); editing (registrant/admin/tech/billing) updates the handles, a role gets its own handle when it differs from the owner |
 | **Nameservers** | Custom nameservers or the managed DNS (`ns1/ns2.domain-reseller-api.de`), switching in both directions |
-| **Glue records** | Register, modify and delete child nameservers (hosts below the domain) |
+| **Glue records** | Register, modify and delete child nameservers (hosts below the domain; HostBill's label `ns1` becomes `ns1.<domain>`) |
 | **Registrar lock** | Read and set the transfer lock where the TLD supports it |
-| **ID protection** | WHOIS privacy for OpenProvider TLDs, otherwise the WHOIS protection flag of the owner contact |
+| **ID protection** | WHOIS privacy for OpenProvider TLDs, otherwise the WHOIS protection flag of the owner contact; enabled after registration when ordered with the domain |
 | **DNS management** | Record management on the managed DNS (enabling it switches the domain to the managed nameservers) |
 | **EPP code** | Retrieves the auth code |
-| **Sync** | Status and expiry date synchronisation |
-| **Pricing** | TLD price import with the bookable term range (e.g. `.ai` from 2 years) |
+| **Sync** | Status, expiry date, nameservers and ID protection |
+| **Availability** | `lookupDomain()` with premium prices |
+| **Pricing** | TLD price import (`getDomainPrices()`) with the exact net total per bookable term (e.g. `.ai` from 2 years) |
 | **Operations** | Sandbox mode, request/response logging with masked secrets |
 
 ## Requirements
@@ -69,6 +70,23 @@ transfer-in (`transferyears`, 2 for `.ai`), `setup` as an additional one-time fe
   (`acceptWppTerms`) – make sure your terms of service cover this.
 - **DNS management** requires the managed DNS. Saving DNS records for a domain with custom nameservers
   switches it to `ns1/ns2.domain-reseller-api.de`.
+
+## HostBill compatibility
+
+Method names, option keys and return formats follow the HostBill domain module dev kit
+([wiki "Domain_Modules"](https://web.archive.org/web/2012/http://wiki.hostbillapp.com/index.php?title=Domain_Modules),
+official examples [example1.zip](http://cdn.hostbillapp.com/WIKI_img/hbdommod/example1.zip) and
+[example2.zip](http://cdn.hostbillapp.com/WIKI_img/hbdommod/example2.zip)). HostBill's current developer
+documentation is not public, so a few points can only be confirmed in a HostBill installation:
+
+- `lookupDomain()` and `getDomainPrices()` use the signatures of current open-source modules. Current HostBill
+  modules declare the interfaces `DomainLookupInterface` and `DomainPriceImport` for these features; the module
+  does not, because their exact method lists are not published. If the lookup or price import does not show up
+  for this module, the interfaces are required.
+- The DNS editor fields are read as `HostName{i}`, `RecordType{i}`, `Address{i}` (as in the dev kit). MX/SRV
+  priorities are read from `Priority{i}` or from an address like `10 mail.example.com`.
+- `synchInfo()` returns only the statuses documented for it (transferred-away and deleted domains become
+  `Expired`).
 
 ## Development
 
