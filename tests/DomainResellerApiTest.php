@@ -35,7 +35,6 @@ class DomainResellerApiTest extends TestCase
             'apiurl'       => ['value' => 'https://domain-reseller-api.de', 'type' => 'input', 'default' => false],
             'apikey'       => ['value' => 'drapi_test_key', 'type' => 'password', 'default' => false],
             'sandbox'      => ['value' => '0', 'type' => 'check', 'default' => '0'],
-            'contact_type' => ['value' => 'person', 'type' => 'select', 'default' => ['person', 'org']],
         ]);
 
         // Default domain params (public in DomainModule stub)
@@ -105,26 +104,30 @@ class DomainResellerApiTest extends TestCase
 
     public function testTestConnectionSuccess(): void
     {
+        // Authenticated endpoint: /health would not validate the API key
         $this->apiMock->expects($this->once())
-            ->method('healthCheck')
-            ->willReturn(['success' => true, 'code' => 200]);
+            ->method('listDomains')
+            ->with(1, 1)
+            ->willReturn(['success' => true, 'data' => ['domains' => []], 'code' => 200]);
+        $this->apiMock->expects($this->never())->method('healthCheck');
 
         $this->assertTrue($this->module->testConnection());
     }
 
-    public function testTestConnectionFallbackToHttpCode(): void
+    public function testTestConnectionRejectsInvalidApiKey(): void
     {
         $this->apiMock->expects($this->once())
-            ->method('healthCheck')
-            ->willReturn(['code' => 200]);
+            ->method('listDomains')
+            ->willReturn(['success' => false, 'error' => 'Invalid API key', 'code' => 401]);
 
-        $this->assertTrue($this->module->testConnection());
+        $this->assertFalse($this->module->testConnection());
+        $this->assertStringContainsString('Invalid API key', $this->module->_errors[0]);
     }
 
     public function testTestConnectionFailure(): void
     {
         $this->apiMock->expects($this->once())
-            ->method('healthCheck')
+            ->method('listDomains')
             ->willReturn(['success' => false, 'error' => 'Connection refused', 'code' => 0]);
 
         $this->assertFalse($this->module->testConnection());
@@ -163,12 +166,75 @@ class DomainResellerApiTest extends TestCase
                 'code' => 200,
             ]);
 
+        // Renewals are driven by HostBill: the API's auto-renew is switched off
+        $this->apiMock->expects($this->once())
+            ->method('updateDomain')
+            ->with('example.com', ['autoRenew' => false])
+            ->willReturn(['success' => true, 'code' => 200]);
+
         $result = $this->module->Register();
 
         $this->assertTrue($result);
         $this->assertSame('Active', $this->module->_domainStatus);
         $this->assertNotEmpty($this->module->_infos);
         $this->assertStringContainsString('registered', $this->module->_infos[0]);
+        $this->assertSame('2028-03-03', $this->module->_expiryDate);
+    }
+
+    public function testRegisterWithoutNameserversOmitsThem(): void
+    {
+        $this->expectContactCreationAny('H1');
+
+        $this->apiMock->expects($this->once())
+            ->method('registerDomain')
+            ->with('example.com', 1, [], $this->anything())
+            ->willReturn(['success' => true, 'data' => [], 'code' => 200]);
+
+        $this->assertTrue($this->module->Register());
+    }
+
+    public function testRegisterRejectsSingleNameserver(): void
+    {
+        $this->module->params['ns1'] = 'ns1.only.com';
+        $this->apiMock->expects($this->never())->method('createContact');
+        $this->apiMock->expects($this->never())->method('registerDomain');
+
+        $this->assertFalse($this->module->Register());
+        $this->assertStringContainsString('At least 2 nameservers', $this->module->_errors[0]);
+    }
+
+    public function testRegisterNormalisesNameservers(): void
+    {
+        $this->module->params['ns1'] = ' NS1.Example.NET. ';
+        $this->module->params['ns2'] = 'ns2.example.net';
+        $this->module->params['ns3'] = 'ns1.example.net';
+        $this->expectContactCreationAny('H1');
+
+        $this->apiMock->expects($this->once())
+            ->method('registerDomain')
+            ->with('example.com', 1, ['ns1.example.net', 'ns2.example.net'], $this->anything())
+            ->willReturn(['success' => true, 'data' => [], 'code' => 200]);
+
+        $this->module->Register();
+    }
+
+    public function testRegisterReportsMinimumTermError(): void
+    {
+        // .ai can only be registered for 2+ years; the API answers 400
+        $this->module->options = ['numyears' => 1, 'sld' => 'example', 'tld' => 'ai'];
+        $this->expectContactCreationAny('H1');
+
+        $this->apiMock->expects($this->once())
+            ->method('registerDomain')
+            ->with('example.ai', 1, $this->anything(), $this->anything())
+            ->willReturn([
+                'success' => false,
+                'error'   => 'A registration term of 1 year(s) is not available for .ai. Bookable terms: 2, 4, 6, 8, 10 year(s).',
+                'code'    => 400,
+            ]);
+
+        $this->assertFalse($this->module->Register());
+        $this->assertStringContainsString('not available for .ai', end($this->module->_errors));
     }
 
     public function testRegisterFailsOnContactCreationError(): void
@@ -242,10 +308,17 @@ class DomainResellerApiTest extends TestCase
                 'code'    => 200,
             ]);
 
+        $this->apiMock->expects($this->once())
+            ->method('updateDomain')
+            ->with('example.com', ['autoRenew' => false])
+            ->willReturn(['success' => false, 'error' => 'Domain cannot be modified in current state', 'code' => 422]);
+
         $result = $this->module->Transfer();
 
+        // A refused auto-renew switch (pending transfer) does not fail the transfer
         $this->assertTrue($result);
         $this->assertSame('Pending Transfer', $this->module->_domainStatus);
+        $this->assertEmpty($this->module->_errors);
     }
 
     public function testTransferUsesEppCodeFromParams(): void
@@ -281,35 +354,40 @@ class DomainResellerApiTest extends TestCase
 
     public function testRenewSuccess(): void
     {
-        $this->apiMock->expects($this->once())
-            ->method('updateDomain')
-            ->with('example.com', ['autoRenew' => true])
-            ->willReturn(['success' => true, 'code' => 200]);
+        $this->module->options['numyears'] = 2;
 
         $this->apiMock->expects($this->once())
-            ->method('getDomain')
-            ->with('example.com')
+            ->method('renewDomain')
+            ->with('example.com', 2)
             ->willReturn([
                 'success' => true,
-                'data'    => ['expiresAt' => '2028-03-03T00:00:00Z'],
+                'data'    => [
+                    'domain'    => 'example.com',
+                    'years'     => 2,
+                    'expiresAt' => '2028-03-03T00:00:00.000Z',
+                    'message'   => 'Domain renewed successfully',
+                ],
                 'code'    => 200,
             ]);
+        $this->apiMock->expects($this->never())->method('updateDomain');
 
         $result = $this->module->Renew();
 
         $this->assertTrue($result);
         $this->assertTrue($this->module->_periodAdded);
         $this->assertSame('2028-03-03', $this->module->_expiryDate);
+        $this->assertStringContainsString('renewed for 2 year(s)', $this->module->_infos[0]);
     }
 
     public function testRenewFailure(): void
     {
         $this->apiMock->expects($this->once())
-            ->method('updateDomain')
-            ->willReturn(['success' => false, 'error' => 'Domain not found', 'code' => 404]);
+            ->method('renewDomain')
+            ->willReturn(['success' => false, 'error' => 'Insufficient wallet balance', 'code' => 402]);
 
         $this->assertFalse($this->module->Renew());
-        $this->assertStringContainsString('Renewal failed', $this->module->_errors[0]);
+        $this->assertFalse($this->module->_periodAdded);
+        $this->assertStringContainsString('Renewal failed: Insufficient wallet balance', $this->module->_errors[0]);
     }
 
     // =================================================================
@@ -336,12 +414,9 @@ class DomainResellerApiTest extends TestCase
         $this->assertFalse($this->module->Suspend());
     }
 
-    public function testUnsuspendEnablesAutoRenew(): void
+    public function testUnsuspendDoesNotReenableApiAutoRenew(): void
     {
-        $this->apiMock->expects($this->once())
-            ->method('updateDomain')
-            ->with('example.com', ['autoRenew' => true])
-            ->willReturn(['success' => true, 'code' => 200]);
+        $this->apiMock->expects($this->never())->method('updateDomain');
 
         $this->assertTrue($this->module->Unsuspend());
         $this->assertStringContainsString('unsuspended', $this->module->_infos[0]);
@@ -411,9 +486,44 @@ class DomainResellerApiTest extends TestCase
         $this->module->params['ns1'] = 'ns1.new.com';
         $this->module->params['ns2'] = 'ns2.new.com';
 
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['useManagedDns' => false], 'code' => 200,
+        ]);
         $this->apiMock->expects($this->once())
             ->method('updateDomain')
             ->with('example.com', ['nameservers' => ['ns1.new.com', 'ns2.new.com']])
+            ->willReturn(['success' => true, 'code' => 200]);
+
+        $this->assertTrue($this->module->updateNameServers());
+    }
+
+    public function testUpdateNameServersAwayFromManagedDnsDisablesIt(): void
+    {
+        $this->module->params['ns1'] = 'ns1.own.net';
+        $this->module->params['ns2'] = 'ns2.own.net';
+
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['useManagedDns' => true], 'code' => 200,
+        ]);
+        $this->apiMock->expects($this->once())
+            ->method('updateDomain')
+            ->with('example.com', ['nameservers' => ['ns1.own.net', 'ns2.own.net'], 'useManagedDns' => false])
+            ->willReturn(['success' => true, 'code' => 200]);
+
+        $this->assertTrue($this->module->updateNameServers());
+    }
+
+    public function testUpdateNameServersToManagedDnsEnablesIt(): void
+    {
+        $this->module->params['ns1'] = 'ns1.domain-reseller-api.de';
+        $this->module->params['ns2'] = 'ns2.domain-reseller-api.de';
+
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['useManagedDns' => false], 'code' => 200,
+        ]);
+        $this->apiMock->expects($this->once())
+            ->method('updateDomain')
+            ->with('example.com', ['useManagedDns' => true])
             ->willReturn(['success' => true, 'code' => 200]);
 
         $this->assertTrue($this->module->updateNameServers());
@@ -433,6 +543,9 @@ class DomainResellerApiTest extends TestCase
         $this->module->params['ns1'] = 'ns1.x.com';
         $this->module->params['ns2'] = 'ns2.x.com';
 
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['useManagedDns' => false], 'code' => 200,
+        ]);
         $this->apiMock->expects($this->once())
             ->method('updateDomain')
             ->willReturn(['success' => false, 'error' => 'Invalid NS', 'code' => 400]);
@@ -473,28 +586,36 @@ class DomainResellerApiTest extends TestCase
         $this->assertSame('www', $records[2]['hostname']);
     }
 
-    public function testGetDNSEnablesManagedDnsOnFailure(): void
+    public function testGetDNSDoesNotEnableManagedDns(): void
     {
-        // First call fails with 400
-        $this->apiMock->expects($this->exactly(2))
-            ->method('getDnsRecords')
-            ->with('example.com')
-            ->willReturnOnConsecutiveCalls(
-                ['success' => false, 'code' => 400],
-                [
-                    'success' => true,
-                    'data'    => ['records' => [['id' => 'r1', 'type' => 'A', 'name' => '@', 'content' => '1.2.3.4', 'ttl' => 3600, 'priority' => null]]],
-                    'code'    => 200,
-                ]
-            );
-
+        // Without managed DNS the API answers HTTP 200 with success:false
         $this->apiMock->expects($this->once())
-            ->method('enableManagedDns')
-            ->with('example.com')
-            ->willReturn(['success' => true, 'code' => 200]);
+            ->method('getDnsRecords')
+            ->willReturn([
+                'success' => false,
+                'error'   => 'Managed DNS is not enabled for this domain. Enable it first to manage DNS records.',
+                'code'    => 200,
+            ]);
+        $this->apiMock->expects($this->never())->method('enableManagedDns');
+        $this->apiMock->expects($this->never())->method('updateDomain');
+
+        $this->assertSame([], $this->module->getDNS());
+    }
+
+    public function testGetDNSSkipsManagedApexNsRecords(): void
+    {
+        $this->apiMock->method('getDnsRecords')->willReturn([
+            'success' => true,
+            'data'    => ['domain' => 'example.com', 'useManagedDns' => true, 'records' => [
+                ['id' => '1', 'type' => 'NS', 'name' => '@', 'content' => 'ns1.domain-reseller-api.de', 'ttl' => 3600, 'priority' => null, 'managed' => true],
+                ['id' => '2', 'type' => 'A', 'name' => '@', 'content' => '1.2.3.4', 'ttl' => 3600, 'priority' => null],
+            ]],
+            'code'    => 200,
+        ]);
 
         $records = $this->module->getDNS();
         $this->assertCount(1, $records);
+        $this->assertSame('A', $records[0]['type']);
     }
 
     public function testGetDNSReturnsEmptyOnTotalFailure(): void
@@ -507,10 +628,15 @@ class DomainResellerApiTest extends TestCase
 
     public function testSetDNSCreatesNewThenDeletesOld(): void
     {
-        // enableManagedDns
+        // Managed DNS is enabled via PATCH /domains/:domain (also switches the nameservers)
         $this->apiMock->expects($this->once())
-            ->method('enableManagedDns')
-            ->willReturn(['success' => true, 'code' => 200]);
+            ->method('getDomain')
+            ->willReturn(['success' => true, 'data' => ['useManagedDns' => false], 'code' => 200]);
+        $this->apiMock->expects($this->once())
+            ->method('updateDomain')
+            ->with('example.com', ['useManagedDns' => true])
+            ->willReturn(['success' => true, 'useManagedDns' => true, 'code' => 200]);
+        $this->apiMock->expects($this->never())->method('enableManagedDns');
 
         // New record created first, returns an ID
         $this->apiMock->expects($this->once())
@@ -530,6 +656,7 @@ class DomainResellerApiTest extends TestCase
                 'success' => true,
                 'data'    => [
                     'records' => [
+                        ['id' => 'ns-1', 'type' => 'NS', 'name' => '@', 'content' => 'ns1.domain-reseller-api.de', 'managed' => true],
                         ['id' => 'old-1', 'type' => 'A', 'name' => '@', 'content' => '1.1.1.1'],
                         ['id' => 'new-1', 'type' => 'A', 'name' => '@', 'content' => '9.9.9.9'],
                     ],
@@ -552,7 +679,7 @@ class DomainResellerApiTest extends TestCase
 
     public function testSetDNSRollsBackOnCreateFailure(): void
     {
-        $this->apiMock->method('enableManagedDns')->willReturn(['success' => true, 'code' => 200]);
+        $this->apiMock->method('getDomain')->willReturn(['success' => true, 'data' => ['useManagedDns' => true], 'code' => 200]);
 
         // First createDnsRecord succeeds, second fails
         $this->apiMock->method('createDnsRecord')
@@ -578,7 +705,7 @@ class DomainResellerApiTest extends TestCase
 
     public function testSetDNSReturnsFalseOnCreateFailure(): void
     {
-        $this->apiMock->method('enableManagedDns')->willReturn(['success' => true, 'code' => 200]);
+        $this->apiMock->method('getDomain')->willReturn(['success' => true, 'data' => ['useManagedDns' => true], 'code' => 200]);
 
         $this->apiMock->expects($this->once())
             ->method('createDnsRecord')
@@ -591,9 +718,38 @@ class DomainResellerApiTest extends TestCase
         $this->assertFalse($result);
     }
 
+    public function testSetDNSSkipsApexNsAndSoa(): void
+    {
+        $this->apiMock->method('getDomain')->willReturn(['success' => true, 'data' => ['useManagedDns' => true], 'code' => 200]);
+        $this->apiMock->method('getDnsRecords')->willReturn(['success' => true, 'data' => ['records' => []], 'code' => 200]);
+
+        $this->apiMock->expects($this->once())
+            ->method('createDnsRecord')
+            ->with('example.com', ['type' => 'TXT', 'name' => '@', 'content' => 'v=spf1 -all', 'ttl' => 3600])
+            ->willReturn(['success' => true, 'data' => ['id' => 't1'], 'code' => 200]);
+
+        $this->assertTrue($this->module->setDNS([
+            ['type' => 'NS', 'hostname' => '@', 'address' => 'ns1.domain-reseller-api.de'],
+            ['type' => 'SOA', 'hostname' => '@', 'address' => 'x'],
+            ['type' => 'TXT', 'hostname' => '', 'address' => 'v=spf1 -all'],
+        ]));
+    }
+
+    public function testSetDNSFailsWhenManagedDnsCannotBeEnabled(): void
+    {
+        $this->apiMock->method('getDomain')->willReturn(['success' => true, 'data' => ['useManagedDns' => false], 'code' => 200]);
+        $this->apiMock->method('updateDomain')->willReturn([
+            'success' => false, 'error' => 'DNS-Zone wurde erstellt, aber die Nameserver antworten noch nicht autoritativ.', 'code' => 503,
+        ]);
+        $this->apiMock->expects($this->never())->method('createDnsRecord');
+
+        $this->assertFalse($this->module->setDNS([['type' => 'A', 'hostname' => '@', 'address' => '1.2.3.4']]));
+        $this->assertStringContainsString('Failed to enable managed DNS', $this->module->_errors[0]);
+    }
+
     public function testSetDNSIncludesPriorityForMX(): void
     {
-        $this->apiMock->method('enableManagedDns')->willReturn(['success' => true, 'code' => 200]);
+        $this->apiMock->method('getDomain')->willReturn(['success' => true, 'data' => ['useManagedDns' => true], 'code' => 200]);
         $this->apiMock->method('getDnsRecords')->willReturn([
             'success' => true, 'data' => ['records' => []], 'code' => 200,
         ]);
@@ -713,9 +869,8 @@ class DomainResellerApiTest extends TestCase
                 'code'    => 200,
             ]);
 
-        $this->apiMock->expects($this->once())
-            ->method('updateContact')
-            ->willReturn(['success' => false, 'error' => 'Invalid email', 'code' => 400]);
+        // Invalid data is rejected before the API call
+        $this->apiMock->expects($this->never())->method('updateContact');
 
         $result = $this->module->setContactDetails([
             'Registrant' => [
@@ -726,6 +881,91 @@ class DomainResellerApiTest extends TestCase
         ]);
 
         $this->assertFalse($result);
+        $this->assertStringContainsString('invalid country, email, phone', $this->module->_errors[0]);
+    }
+
+    public function testSetContactDetailsApiFailure(): void
+    {
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['contacts' => ['owner' => 'H-OWN']], 'code' => 200,
+        ]);
+        $this->apiMock->expects($this->once())
+            ->method('updateContact')
+            ->willReturn(['success' => false, 'error' => 'Validation error', 'code' => 400]);
+
+        $this->assertFalse($this->module->setContactDetails(['Registrant' => self::contactForm('Jane')]));
+        $this->assertStringContainsString('Failed to update Registrant contact: Validation error', $this->module->_errors[0]);
+    }
+
+    public function testSetContactDetailsSendsApiFieldNames(): void
+    {
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['contacts' => ['owner' => 'H-OWN']], 'code' => 200,
+        ]);
+        $this->apiMock->expects($this->once())
+            ->method('updateContact')
+            ->with('H-OWN', [
+                // type and sex can not be changed via PATCH; "" clears organisation/house number
+                'firstName'    => 'Jane',
+                'lastName'     => 'Doe',
+                'street'       => 'Gartenweg',
+                'postalCode'   => '80331',
+                'city'         => 'München',
+                'country'      => 'DE',
+                'email'        => 'jane@example.com',
+                'phone'        => '+49.8912345678',
+                'houseNumber'  => '5',
+                'state'        => 'Bayern',
+                'organization' => '',
+            ])
+            ->willReturn(['success' => true, 'message' => 'Contact updated successfully', 'code' => 200]);
+
+        $this->assertTrue($this->module->setContactDetails(['Registrant' => self::contactForm('Jane')]));
+    }
+
+    public function testSetContactDetailsGivesSharedRoleOwnContact(): void
+    {
+        // Admin and tech share the owner's handle (as created by Register)
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true,
+            'data'    => ['contacts' => ['owner' => 'H-OWN', 'admin' => 'H-OWN', 'tech' => 'H-OWN']],
+            'code'    => 200,
+        ]);
+
+        // Owner is updated in place, only once
+        $this->apiMock->expects($this->once())
+            ->method('updateContact')
+            ->with('H-OWN', $this->anything())
+            ->willReturn(['success' => true, 'code' => 200]);
+
+        // Admin has different data → own contact, assigned via PATCH /domains/:domain/contacts
+        $this->apiMock->expects($this->once())
+            ->method('createContact')
+            ->with($this->callback(function ($data) {
+                return $data['firstName'] === 'Admin' && $data['type'] === 'person' && $data['sex'] === 'NA';
+            }))
+            ->willReturn(['success' => true, 'data' => ['id' => 'c2', 'handle' => 'H-ADM2', 'message' => 'ok'], 'code' => 200]);
+
+        $this->apiMock->expects($this->once())
+            ->method('updateDomainContacts')
+            ->with('example.com', ['admin' => 'H-ADM2'])
+            ->willReturn(['success' => true, 'code' => 200]);
+
+        $this->assertTrue($this->module->setContactDetails([
+            'Registrant' => self::contactForm('Jane'),
+            'Admin'      => self::contactForm('Admin'),
+            'Tech'       => self::contactForm('Jane'),
+        ]));
+    }
+
+    private static function contactForm(string $firstName): array
+    {
+        return [
+            'First Name' => $firstName, 'Last Name' => 'Doe', 'Company Name' => '',
+            'Email' => 'jane@example.com', 'Address 1' => 'Gartenweg 5',
+            'City' => 'München', 'State' => 'Bayern', 'Postcode' => '80331',
+            'Country' => 'DE', 'Phone' => '+49.8912345678',
+        ];
     }
 
     // =================================================================
@@ -746,6 +986,17 @@ class DomainResellerApiTest extends TestCase
         $this->assertSame('SECRET-EPP-123', $this->module->getEPPCode());
     }
 
+    public function testGetEPPCodeRejectsPlaceholderText(): void
+    {
+        $this->apiMock->method('getAuthCode')->willReturn([
+            'success' => true,
+            'data'    => ['domain' => 'example.com', 'authCode' => 'Unable to retrieve auth code'],
+            'code'    => 200,
+        ]);
+
+        $this->assertFalse($this->module->getEPPCode());
+    }
+
     public function testGetEPPCodeFailure(): void
     {
         $this->apiMock->expects($this->once())
@@ -764,14 +1015,16 @@ class DomainResellerApiTest extends TestCase
     {
         $this->apiMock->expects($this->once())
             ->method('checkDomain')
-            ->with('example.com')
+            ->with('example.com', 1)
             ->willReturn([
                 'success' => true,
                 'data'    => [
-                    'domain'    => 'example.com',
-                    'available' => true,
-                    'premium'   => false,
-                    'setupPrice' => 9.99,
+                    'domain'     => 'example.com',
+                    'available'  => true,
+                    'premium'    => false,
+                    'price'      => 9.99,
+                    'years'      => 1,
+                    'setupPrice' => null,
                 ],
                 'code' => 200,
             ]);
@@ -847,13 +1100,53 @@ class DomainResellerApiTest extends TestCase
             ->method('getDomain')
             ->willReturn([
                 'success' => true,
-                'data'    => ['status' => 'transferring', 'expiresAt' => null],
+                'data'    => ['status' => 'pending_transfer', 'expiresAt' => null],
                 'code'    => 200,
             ]);
 
         $result = $this->module->synchInfo();
         $this->assertSame('Pending Transfer', $result['status']);
         $this->assertArrayNotHasKey('expires', $result);
+    }
+
+    /**
+     * @dataProvider apiStatusProvider
+     */
+    public function testSynchInfoMapsApiStates(string $apiStatus, string $hostBillStatus): void
+    {
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['status' => $apiStatus, 'expiresAt' => null, 'autoRenew' => false], 'code' => 200,
+        ]);
+
+        $this->assertSame($hostBillStatus, $this->module->synchInfo()['status']);
+    }
+
+    public function apiStatusProvider(): array
+    {
+        return [
+            ['pending', 'Pending'],
+            ['pending_transfer', 'Pending Transfer'],
+            ['active', 'Active'],
+            ['expired', 'Expired'],
+            ['redemption', 'Expired'],
+            ['pending_delete', 'Active'],
+            ['transferred_away', 'Transferred Away'],
+            ['suspended', 'Active'],
+            ['deleted', 'Cancelled'],
+        ];
+    }
+
+    public function testSynchInfoDisablesApiAutoRenewOfActiveDomain(): void
+    {
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['status' => 'active', 'autoRenew' => true, 'expiresAt' => '2027-01-01T00:00:00Z'], 'code' => 200,
+        ]);
+        $this->apiMock->expects($this->once())
+            ->method('updateDomain')
+            ->with('example.com', ['autoRenew' => false])
+            ->willReturn(['success' => true, 'code' => 200]);
+
+        $this->module->synchInfo();
     }
 
     public function testSynchInfoUnknownStatusDefaultsToActive(): void
@@ -1007,7 +1300,9 @@ class DomainResellerApiTest extends TestCase
         $this->apiMock->expects($this->once())
             ->method('createContact')
             ->with($this->callback(function ($data) {
-                return $data['type'] === 'org' && $data['organization'] === 'ACME GmbH';
+                // API enum: person|organization|role; sex is required (MALE|FEMALE|NA)
+                return $data['type'] === 'organization' && $data['organization'] === 'ACME GmbH'
+                    && $data['sex'] === 'NA';
             }))
             ->willReturn(['success' => true, 'data' => ['handle' => 'H-ORG'], 'code' => 201]);
 
@@ -1025,7 +1320,9 @@ class DomainResellerApiTest extends TestCase
         $this->apiMock->expects($this->once())
             ->method('createContact')
             ->with($this->callback(function ($data) {
-                return $data['type'] === 'person';
+                // Natural persons have no organisation
+                return $data['type'] === 'person' && $data['sex'] === 'NA'
+                    && !array_key_exists('organization', $data);
             }))
             ->willReturn(['success' => true, 'data' => ['handle' => 'H-PER'], 'code' => 201]);
 
@@ -1064,7 +1361,8 @@ class DomainResellerApiTest extends TestCase
         $this->apiMock->expects($this->once())
             ->method('createContact')
             ->with($this->callback(function ($data) {
-                return $data['street'] === 'Post Office Box' && $data['houseNumber'] === '';
+                // houseNumber is optional and omitted when there is none
+                return $data['street'] === 'Post Office Box' && !array_key_exists('houseNumber', $data);
             }))
             ->willReturn(['success' => true, 'data' => ['handle' => 'H1'], 'code' => 201]);
 
@@ -1081,7 +1379,7 @@ class DomainResellerApiTest extends TestCase
     public function testApiCallsAreLogged(): void
     {
         $this->apiMock->expects($this->once())
-            ->method('healthCheck')
+            ->method('listDomains')
             ->willReturn(['success' => true, 'code' => 200]);
 
         $this->module->testConnection();
@@ -1102,7 +1400,8 @@ class DomainResellerApiTest extends TestCase
         $this->apiMock->expects($this->once())
             ->method('createContact')
             ->with($this->callback(function ($data) {
-                return $data['phone'] === '+493012345678';
+                // API pattern ^\+\d+\.\d+$ — the dot must be kept
+                return $data['phone'] === '+49.3012345678';
             }))
             ->willReturn(['success' => true, 'data' => ['handle' => 'H1'], 'code' => 201]);
 
@@ -1152,5 +1451,300 @@ class DomainResellerApiTest extends TestCase
             ->willReturn(['success' => true, 'data' => [], 'code' => 200]);
 
         $this->assertTrue($this->module->Register());
+    }
+
+    // =================================================================
+    // Contact payload (POST /contacts schema)
+    // =================================================================
+
+    public function testContactPayloadMatchesApiSchema(): void
+    {
+        $payload = DomainResellerApi::buildContactPayload([
+            'firstname'   => 'Max',
+            'lastname'    => 'Mustermann',
+            'companyname' => 'ACME GmbH',
+            'email'       => 'max@example.com',
+            'address1'    => 'Hauptstraße 42',
+            'address2'    => 'Hinterhaus',
+            'city'        => 'Hannover',
+            'state'       => 'Niedersachsen',
+            'postcode'    => '30159',
+            'country'     => 'de',
+            'phonenumber' => '0511 123456',
+            'pin'         => 'DE123456789',
+        ]);
+
+        $this->assertSame([
+            'type'         => 'organization',
+            'sex'          => 'NA',
+            'firstName'    => 'Max',
+            'lastName'     => 'Mustermann',
+            'street'       => 'Hauptstraße',
+            'postalCode'   => '30159',
+            'city'         => 'Hannover',
+            'country'      => 'DE',
+            'email'        => 'max@example.com',
+            'phone'        => '+49.511123456',
+            'houseNumber'  => '42',
+            'organization' => 'ACME GmbH',
+            'extension'    => 'Hinterhaus',
+            // Passed as entered; the API maps it to the ISO 3166-2 code for .it
+            'state'        => 'Niedersachsen',
+            'pin'          => 'DE123456789',
+        ], $payload);
+
+        $this->assertContains($payload['type'], ['person', 'organization', 'role']);
+        $this->assertContains($payload['sex'], ['MALE', 'FEMALE', 'NA']);
+        $this->assertMatchesRegularExpression('/^\+\d+\.\d+$/', $payload['phone']);
+        $this->assertMatchesRegularExpression('/^[A-Za-z]{2}$/', $payload['country']);
+    }
+
+    public function testContactPayloadFillsRequiredFieldsForCompanyWithoutNames(): void
+    {
+        $payload = DomainResellerApi::buildContactPayload([
+            'companyname' => 'ACME GmbH', 'email' => 'info@acme.de', 'address1' => '',
+            'city' => '', 'postcode' => '', 'country' => 'DE', 'phonenumber' => '+49 30 1234',
+        ]);
+
+        // firstName/lastName/street/postalCode/city have minLength 1 in the API
+        $this->assertSame('ACME GmbH', $payload['firstName']);
+        $this->assertSame('ACME GmbH', $payload['lastName']);
+        $this->assertSame('-', $payload['street']);
+        $this->assertSame('-', $payload['postalCode']);
+        $this->assertSame('-', $payload['city']);
+        $this->assertArrayNotHasKey('state', $payload);
+        $this->assertArrayNotHasKey('pin', $payload);
+    }
+
+    public function testRegisterRejectsUnformattablePhoneLocally(): void
+    {
+        $this->module->client_data['phonenumber'] = 'n/a';
+        $this->apiMock->expects($this->never())->method('createContact');
+        $this->apiMock->expects($this->never())->method('registerDomain');
+
+        $this->assertFalse($this->module->Register());
+        $this->assertStringContainsString('invalid phone', $this->module->_errors[0]);
+    }
+
+    /**
+     * @dataProvider phoneProvider
+     */
+    public function testFormatPhone(string $input, string $country, ?string $expected): void
+    {
+        $this->assertSame($expected, DomainResellerApi::formatPhone($input, $country));
+    }
+
+    public function phoneProvider(): array
+    {
+        return [
+            'already API format'      => ['+49.3012345678', 'DE', '+49.3012345678'],
+            'international spaces'    => ['+49 30 12345678', 'DE', '+49.3012345678'],
+            'redundant trunk prefix'  => ['+49 (0)30 12345678', 'DE', '+49.3012345678'],
+            '00 prefix'               => ['0049 30 12345678', 'DE', '+49.3012345678'],
+            'national with country'   => ['030 12345678', 'DE', '+49.3012345678'],
+            'Italy keeps trunk 0'     => ['06 1234567', 'IT', '+39.061234567'],
+            'NANP with leading 1'     => ['1 (555) 123-4567', 'US', '+1.5551234567'],
+            'other country code'      => ['+43 1 234567', 'DE', '+43.1234567'],
+            'empty'                   => ['', 'DE', null],
+            'national without country'=> ['030 1234', '', null],
+        ];
+    }
+
+    /**
+     * @dataProvider streetProvider
+     */
+    public function testSplitStreet(string $address, array $expected): void
+    {
+        $this->assertSame($expected, DomainResellerApi::splitStreet($address));
+    }
+
+    public function streetProvider(): array
+    {
+        return [
+            ['Hauptstraße 42', ['Hauptstraße', '42']],
+            ['Hauptstraße 42 b', ['Hauptstraße', '42b']],
+            ['Am Markt 3-5', ['Am Markt', '3-5']],
+            ['123 Main Street', ['Main Street', '123']],
+            ['Post Office Box', ['Post Office Box', '']],
+            ['', ['', '']],
+        ];
+    }
+
+    public function testGetContactDetailsHidesOrganisationOfPersons(): void
+    {
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['contacts' => ['owner' => 'H-OWN']], 'code' => 200,
+        ]);
+        $this->apiMock->method('getContact')->willReturn(['success' => true, 'data' => [
+            'handle' => 'H-OWN', 'type' => 'person', 'firstName' => 'Max', 'lastName' => 'M',
+            'organization' => 'Max M', 'street' => 'Weg', 'houseNumber' => null, 'extension' => 'c/o X',
+            'city' => 'Berlin', 'postalCode' => '10115', 'state' => null, 'country' => 'DE',
+            'email' => 'm@example.com', 'phone' => '+49.301234',
+        ], 'code' => 200]);
+
+        $result = $this->module->getContactDetails();
+        $this->assertSame('', $result['Registrant']['Company Name']);
+        $this->assertSame('Weg', $result['Registrant']['Address 1']);
+        $this->assertSame('c/o X', $result['Registrant']['Address 2']);
+    }
+
+    // =================================================================
+    // Registrar lock
+    // =================================================================
+
+    public function testGetRegistrarLock(): void
+    {
+        $this->apiMock->expects($this->once())
+            ->method('getLock')
+            ->with('example.com')
+            ->willReturn(['success' => true, 'data' => ['domain' => 'example.com', 'supported' => true, 'locked' => true], 'code' => 200]);
+
+        $this->assertTrue($this->module->getRegistrarLock());
+    }
+
+    public function testGetRegistrarLockUnsupportedTld(): void
+    {
+        $this->apiMock->method('getLock')->willReturn([
+            'success' => true, 'data' => ['domain' => 'example.de', 'supported' => false, 'locked' => null], 'code' => 200,
+        ]);
+
+        $this->assertFalse($this->module->getRegistrarLock());
+    }
+
+    public function testUpdateRegistrarLock(): void
+    {
+        $this->module->options['registrarLock'] = 1;
+
+        $this->apiMock->expects($this->once())
+            ->method('setLock')
+            ->with('example.com', true)
+            ->willReturn(['success' => true, 'data' => ['domain' => 'example.com', 'locked' => true], 'code' => 200]);
+
+        $this->assertTrue($this->module->updateRegistrarLock());
+    }
+
+    public function testUpdateRegistrarLockFailure(): void
+    {
+        $this->apiMock->method('setLock')->willReturn([
+            'success' => false, 'error' => 'This TLD has no transfer lock', 'code' => 422,
+        ]);
+
+        $this->assertFalse($this->module->updateRegistrarLock());
+        $this->assertStringContainsString('no transfer lock', $this->module->_errors[0]);
+    }
+
+    // =================================================================
+    // Glue records
+    // =================================================================
+
+    public function testRegisterNameServer(): void
+    {
+        $this->module->options['NameServer']   = 'NS1.example.com';
+        $this->module->options['NameServerIP'] = '192.0.2.10';
+
+        $this->apiMock->expects($this->once())
+            ->method('createHost')
+            ->with('example.com', 'ns1.example.com', '192.0.2.10', '')
+            ->willReturn(['success' => true, 'data' => ['hostname' => 'ns1.example.com', 'ipv4' => '192.0.2.10'], 'code' => 200]);
+
+        $this->assertTrue($this->module->registerNameServer());
+    }
+
+    public function testModifyNameServerWithIpv6(): void
+    {
+        $this->module->options['NameServer']      = 'ns1.example.com';
+        $this->module->options['NameServerNewIP'] = '2001:db8::1';
+
+        $this->apiMock->expects($this->once())
+            ->method('updateHost')
+            ->with('example.com', 'ns1.example.com', '', '2001:db8::1')
+            ->willReturn(['success' => true, 'data' => ['hostname' => 'ns1.example.com'], 'code' => 200]);
+
+        $this->assertTrue($this->module->modifyNameServer());
+    }
+
+    public function testDeleteNameServer(): void
+    {
+        $this->module->options['NameServer'] = 'ns1.example.com';
+
+        $this->apiMock->expects($this->once())
+            ->method('deleteHost')
+            ->with('example.com', 'ns1.example.com')
+            ->willReturn(['success' => false, 'error' => 'Host is still in use', 'code' => 409]);
+
+        $this->assertFalse($this->module->deleteNameServer());
+        $this->assertStringContainsString('still in use', $this->module->_errors[0]);
+    }
+
+    // =================================================================
+    // ID protection
+    // =================================================================
+
+    public function testUpdateIDProtectionEnablesWhoisPrivacyWithTerms(): void
+    {
+        $this->module->options['idprotection'] = 1;
+
+        $this->apiMock->expects($this->once())
+            ->method('setWhoisPrivacy')
+            ->with('example.com', true, true)
+            ->willReturn(['success' => true, 'data' => ['domain' => 'example.com', 'whoisPrivacy' => true], 'code' => 200]);
+        $this->apiMock->expects($this->never())->method('updateContact');
+
+        $this->assertTrue($this->module->updateIDProtection());
+    }
+
+    public function testUpdateIDProtectionFallsBackToContactProtection(): void
+    {
+        $this->module->options['idprotection'] = 0;
+
+        // Vautron TLDs: whois-privacy is OpenProvider-only (400) → contact protection flag
+        $this->apiMock->method('setWhoisPrivacy')->willReturn([
+            'success' => false, 'error' => 'WHOIS privacy is only available for OpenProvider domains', 'code' => 400,
+        ]);
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['contacts' => ['owner' => 'H-OWN']], 'code' => 200,
+        ]);
+        $this->apiMock->expects($this->once())
+            ->method('updateContact')
+            ->with('H-OWN', ['protection' => false])
+            ->willReturn(['success' => true, 'code' => 200]);
+
+        $this->assertTrue($this->module->updateIDProtection());
+    }
+
+    public function testGetIDProtectionFromContact(): void
+    {
+        $this->apiMock->method('getDomain')->willReturn([
+            'success' => true, 'data' => ['whoisPrivacy' => false, 'contacts' => ['owner' => 'H-OWN']], 'code' => 200,
+        ]);
+        $this->apiMock->method('getContact')->willReturn([
+            'success' => true, 'data' => ['handle' => 'H-OWN', 'protection' => true], 'code' => 200,
+        ]);
+
+        $this->assertTrue($this->module->getIDProtection());
+    }
+
+    // =================================================================
+    // Pricing import: minimum terms
+    // =================================================================
+
+    public function testImportTLDPricingMinimumTermAndTransferYears(): void
+    {
+        $this->apiMock->method('getPricing')->willReturn([
+            'success' => true,
+            'data'    => [[
+                'tld' => 'ai', 'registerPrice' => '70.00', 'renewPrice' => '70.00',
+                'transferPrice' => '140.00', 'transferYears' => 2, 'restorePrice' => null,
+                'setupPrice' => null, 'minYears' => 2, 'maxYears' => 10,
+                'periods' => [['years' => 2, 'registerPrice' => '140.00', 'renewPrice' => '140.00']],
+            ]],
+            'currency' => 'EUR',
+            'code'     => 200,
+        ]);
+
+        $pricing = $this->module->importTLDPricing();
+        $this->assertSame(2, $pricing['ai']['minyears']);
+        $this->assertSame(2, $pricing['ai']['transferyears']);
+        $this->assertSame(140.0, $pricing['ai']['transfer']);
     }
 }
